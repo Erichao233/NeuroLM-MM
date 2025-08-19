@@ -12,6 +12,7 @@ from model.model_neural_transformer import NeuralTransformer
 from model.norm_ema_quantizer import NormEMAVectorQuantizer
 
 from torch.autograd import Function
+from typing import Optional, Dict
 from transformers import GPT2LMHeadModel
 
 
@@ -37,6 +38,7 @@ class VQ(nn.Module):
                  quantize_kmeans_init=True,
                  decoder_out_dim=200,
                  smooth_l1_loss = False,
+                 shared_quantizer=None,  # NEW: external shared quantizer for cross-modal sharing
                  **kwargs
                  ):
         super().__init__()
@@ -53,9 +55,29 @@ class VQ(nn.Module):
         self.decoder_freq = NeuralTransformer(decoder_config)
         self.decoder_raw = NeuralTransformer(decoder_config)
                 
-        self.quantize = NormEMAVectorQuantizer(
-            n_embed=n_embed, embedding_dim=embed_dim, beta=1.0, kmeans_init=quantize_kmeans_init, decay=decay,
-        )
+        # codebook configuration: support shared + private split (PhysioOmni-style)
+        self.shared_codes = int(kwargs.get('shared_codes', 0) or 0)
+        self.private_codes = int(kwargs.get('private_codes', 0) or 0)
+        
+        if self.shared_codes > 0 and self.private_codes > 0:
+            # Use external shared quantizer if provided, otherwise create new one
+            if shared_quantizer is not None:
+                self.quantize_shared = shared_quantizer
+                print(f"Using external shared quantizer with {self.quantize_shared.num_tokens} codes")
+            else:
+                self.quantize_shared = NormEMAVectorQuantizer(
+                    n_embed=self.shared_codes, embedding_dim=embed_dim, beta=1.0, kmeans_init=quantize_kmeans_init, decay=decay,
+                )
+                print(f"Created new shared quantizer with {self.shared_codes} codes")
+            
+            self.quantize_private = NormEMAVectorQuantizer(
+                n_embed=self.private_codes, embedding_dim=embed_dim, beta=1.0, kmeans_init=quantize_kmeans_init, decay=decay,
+            )
+            self.quantize = None
+        else:
+            self.quantize = NormEMAVectorQuantizer(
+                n_embed=n_embed, embedding_dim=embed_dim, beta=1.0, kmeans_init=quantize_kmeans_init, decay=decay,
+            )
 
         self.decoder_out_dim = decoder_out_dim
 
@@ -103,7 +125,9 @@ class VQ(nn.Module):
         return self.decoder.cls_token.device
     
     def get_number_of_tokens(self):
-        return self.quantize.n_e
+        if self.quantize is not None:
+            return self.quantize.n_e
+        return self.shared_codes + self.private_codes
 
     def get_tokens(self, data, input_chans=None, input_times=None, mask=None, **kwargs):
         quantize, embed_ind, loss, _ = self.encode(data, input_chans, input_times, mask)
@@ -116,9 +140,29 @@ class VQ(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             to_quantizer_features = self.encode_task_layer(encoder_features.type_as(self.encode_task_layer[-1].weight))
 
-        quantize, loss, embed_ind = self.quantize(to_quantizer_features)
+        # single codebook (backward compatible)
+        if self.quantize is not None:
+            quantize, loss, embed_ind = self.quantize(to_quantizer_features)
+            return quantize, embed_ind, loss, encoder_features
 
-        return quantize, embed_ind, loss, encoder_features
+        # shared + private codebooks: choose per-token the lower reconstruction error
+        q_shared, loss_s, ind_s = self.quantize_shared(to_quantizer_features)
+        q_priv, loss_p, ind_p = self.quantize_private(to_quantizer_features)
+
+        # per-token errors to decide routing
+        err_s = (to_quantizer_features - q_shared).pow(2).sum(dim=-1, keepdim=True)
+        err_p = (to_quantizer_features - q_priv).pow(2).sum(dim=-1, keepdim=True)
+        use_shared_mask = (err_s <= err_p).squeeze(-1)  # [B,N] bool
+        quantize = use_shared_mask.unsqueeze(-1) * q_shared + (~use_shared_mask).unsqueeze(-1) * q_priv
+        # embed indices with offset for private; ensure 2D indexing
+        B, N, _ = to_quantizer_features.shape
+        ind_s_2d = ind_s.view(B, N) if ind_s.dim() == 1 else ind_s
+        ind_p_2d = ind_p.view(B, N) if ind_p.dim() == 1 else ind_p
+        ind_combined = ind_s_2d.clone()
+        ind_combined[~use_shared_mask] = ind_p_2d[~use_shared_mask] + self.shared_codes
+        loss = loss_s + loss_p
+
+        return quantize, ind_combined, loss, encoder_features
         
     def decode(self, quantize, input_chans=None, input_time=None, mask=None, **kwargs):
         # reshape tokens to feature maps for patch embed in decoder
@@ -194,14 +238,30 @@ class VQ_Align(nn.Module):
     def __init__(self, 
                  encoder_config,
                  decoder_config,
+                 infonce_weight: float = 0.0,
+                 intra_periph_pred_weight: float = 0.0,
+                 vq_kwargs: Optional[Dict] = None,
+                 shared_quantizer=None,  # NEW: external shared quantizer for cross-modal sharing
                  ):
         super(VQ_Align, self).__init__()
-        self.VQ = VQ(encoder_config, decoder_config)
+        vq_kwargs = vq_kwargs or {}
+        # Pass shared quantizer to VQ
+        self.VQ = VQ(encoder_config, decoder_config, shared_quantizer=shared_quantizer, **vq_kwargs)
         self.domain_classifier = nn.Sequential(
                 nn.Linear(decoder_config.n_embd, 256),
                 nn.GELU(),
                 nn.Linear(256, 2)
             )
+        # contrastive & intra-peripheral prediction heads
+        self.infonce_weight = float(infonce_weight)
+        self.intra_periph_pred_weight = float(intra_periph_pred_weight)
+        proj_dim = 128
+        self.contrast_proj = nn.Sequential(
+            nn.Linear(encoder_config.n_embd, encoder_config.n_embd), nn.GELU(), nn.Linear(encoder_config.n_embd, proj_dim)
+        ) if self.infonce_weight > 0 else nn.Identity()
+        self.periph_pred = nn.Sequential(
+            nn.Linear(encoder_config.n_embd, encoder_config.n_embd), nn.GELU(), nn.Linear(encoder_config.n_embd, encoder_config.n_embd)
+        ) if self.intra_periph_pred_weight > 0 else nn.Identity()
 
         model_hf = GPT2LMHeadModel.from_pretrained('gpt2')
         sd_hf = model_hf.state_dict()
@@ -229,6 +289,62 @@ class VQ_Align(nn.Module):
             domain_loss = F.cross_entropy(domain_out.view(-1, domain_out.size(-1)), target.view(-1), ignore_index=-1)
             split="train" if self.training else "val"
             log[f'{split}/domain_loss'] = domain_loss.detach().item()
+            # InfoNCE across channels within the same time step (intra-sample, in-batch negatives)
+            if self.infonce_weight > 0 and input_time is not None and input_mask is not None:
+                B, N, D = encoder_features.shape
+                feats = self.contrast_proj(encoder_features)  # [B,N,proj]
+                feats = F.normalize(feats, dim=-1)
+                time_flat = input_time.view(-1)
+                mask_flat = input_mask.view(-1)
+                feats_flat = feats.view(B*N, -1)
+                # build a simple positive index: for each token, pick another token with same (b,time) if available
+                pos_idx = torch.full((B*N,), -1, device=x.device, dtype=torch.long)
+                for b in range(B):
+                    t_vals = input_time[b][input_mask[b]].unique()
+                    for t in t_vals:
+                        idxs = torch.nonzero((input_time[b] == t) & input_mask[b]).squeeze(-1)
+                        if idxs.numel() > 1:
+                            a = (b*N) + idxs
+                            # rotate by one as positives
+                            pos_idx[a] = torch.roll(a, shifts=1, dims=0)
+                valid = (pos_idx >= 0)
+                if valid.any():
+                    q = feats_flat[valid]
+                    k_pos = feats_flat[pos_idx[valid]]
+                    logits_pos = (q * k_pos).sum(dim=-1, keepdim=True)
+                    logits_neg = q @ feats_flat.t()  # [M, B*N]
+                    # mask self with very small value
+                    eye_mask = torch.eye(logits_neg.size(1), device=x.device)[pos_idx[valid]] * 1e9
+                    logits = torch.cat([logits_pos, logits_neg - eye_mask], dim=1)
+                    labels = torch.zeros(logits.size(0), dtype=torch.long, device=x.device)
+                    tau = 0.1
+                    infonce = F.cross_entropy(logits / tau, labels)
+                    loss = loss + self.infonce_weight * infonce
+                    log[f'{split}/infonce'] = infonce.detach().item()
+            # Intra-peripheral prediction (random channel split A→B per time)
+            if self.intra_periph_pred_weight > 0 and input_time is not None and input_mask is not None:
+                B, N, D = encoder_features.shape
+                pred_loss = encoder_features.new_tensor(0.0)
+                count = 0
+                for b in range(B):
+                    t_vals = input_time[b][input_mask[b]].unique()
+                    for t in t_vals:
+                        idxs = torch.nonzero((input_time[b] == t) & input_mask[b]).squeeze(-1)
+                        if idxs.numel() < 2:
+                            continue
+                        # random split
+                        a = idxs[::2]; bset = idxs[1::2]
+                        if a.numel() == 0 or bset.numel() == 0:
+                            continue
+                        a_mean = encoder_features[b, a].mean(dim=0, keepdim=True)  # [1,D]
+                        pred = self.periph_pred(a_mean)
+                        target = encoder_features[b, bset].mean(dim=0, keepdim=True)
+                        pred_loss = pred_loss + F.mse_loss(pred, target)
+                        count += 1
+                if count > 0:
+                    pred_loss = pred_loss / count
+                    loss = loss + self.intra_periph_pred_weight * pred_loss
+                    log[f'{split}/periph_pred'] = pred_loss.detach().item()
             return loss, domain_loss, log
         else:
             x = self.wte(x).detach()

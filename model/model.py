@@ -133,6 +133,8 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        # the base text vocab size of GPT-2 checkpoints; used to detect absolute targets from EEG tokens
+        self.base_text_vocab = 50257
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -185,7 +187,16 @@ class GPT(nn.Module):
             x = x_eeg + pos_emb
             mask = eeg_mask
             if y_eeg is not None:
-                targets = y_eeg + self.config.vocab_size
+                if torch.is_tensor(y_eeg):
+                    valid = y_eeg.detach() >= 0
+                    if not valid.any():
+                        targets = y_eeg
+                    elif y_eeg.detach()[valid].min() >= self.base_text_vocab:
+                        targets = y_eeg  # already absolute ids in [base_text_vocab, vocab)
+                    else:
+                        targets = y_eeg + self.config.vocab_size
+                else:
+                    targets = y_eeg + self.config.vocab_size
             else:
                 targets = None
         elif x_text is not None and x_eeg is None:
@@ -222,8 +233,16 @@ class GPT(nn.Module):
             elif y_eeg == 'nan' or y_text == 'nan':
                 targets = 'nan'
             else:
-                y_eeg = y_eeg + self.config.vocab_size
-                targets = torch.cat((y_eeg, y_text), dim=-1)
+                # If EEG targets are already absolute ids (>= base_text_vocab), don't shift again
+                if torch.is_tensor(y_eeg):
+                    valid = y_eeg.detach() >= 0
+                    if not valid.any():
+                        targets = torch.cat((y_eeg, y_text), dim=-1)
+                    elif y_eeg.detach()[valid].min() >= self.base_text_vocab:
+                        targets = torch.cat((y_eeg, y_text), dim=-1)
+                    else:
+                        y_eeg = y_eeg + self.config.vocab_size
+                        targets = torch.cat((y_eeg, y_text), dim=-1)
 
         x = self.transformer.drop(x)
         
@@ -239,6 +258,11 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             if targets == 'nan':
                 return logits, None, None
+            # harden targets to valid range to avoid CUDA assert
+            if torch.is_tensor(targets):
+                n_classes = logits.size(-1)
+                targets = targets.clone()
+                targets[(targets >= n_classes) | (targets < -1)] = -1
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
             _, preds = logits.max(dim=-1)

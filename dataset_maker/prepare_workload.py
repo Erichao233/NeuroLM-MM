@@ -89,7 +89,7 @@ def save_pickle(object, filename):
         pickle.dump(object, f)
 
 
-root = "/home/v-weibjiang/EEGworkload/physionet.org/files/eegmat/1.0.0"
+root = "/root/autodl-tmp/NeuroLM/NeuroLM/h5data/eeg-during-mental-arithmetic-tasks-1.0.0"
 out_dir = '../EEGWorkload'
 train_out_dir = os.path.join(out_dir, "train")
 eval_out_dir = os.path.join(out_dir, "eval")
@@ -107,7 +107,11 @@ for dirName, subdirList, fileList in os.walk(root):
         if fname[-4:] == ".edf":
             edf_files.append(os.path.join(dirName, fname))
 edf_files.sort()
-
+# --- 在这里添加诊断代码 ---
+print(f"总共找到了 {len(edf_files)} 个 .edf 文件。")
+if edf_files:
+    print("找到的前5个文件是:", edf_files[:5])
+# --- 诊断代码结束 ---
 train_files = edf_files[:52]
 eval_files = edf_files[52:62]
 test_files = edf_files[62:]

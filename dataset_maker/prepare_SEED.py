@@ -35,6 +35,8 @@ class h5Dataset:
 def preprocessing(cntFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200):
     # 读取cnt
     raw = mne.io.read_raw_cnt(cntFilePath, preload=True, data_format='int32')
+    #raw = mne.io.read_raw_ant(cntFilePath, preload=True)
+
     raw.drop_channels(['M1', 'M2', 'VEO', 'HEO'])
     if 'ECG' in raw.ch_names:
         raw.drop_channels(['ECG'])
@@ -49,8 +51,8 @@ def preprocessing(cntFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200):
     return eegData, raw.ch_names
 
 
-savePath = Path('/home/liming.zhao/projects/shock/shock-data/h5Data')
-rawDataPath = Path('/home/liming.zhao/projects/shock/shock-data/seed-3')
+savePath = Path('/root/autodl-tmp/NeuroLM/NeuroLM_fix/h5data')
+rawDataPath = Path('/root/autodl-tmp/Datasets/SEED')
 group = rawDataPath.glob('*.cnt')
 
 trialStartTime = [24, 289, 550, 782, 1049, 1260, 1483, 1747, 1993, 2283, 2550, 2812, 3072, 3332, 3598]

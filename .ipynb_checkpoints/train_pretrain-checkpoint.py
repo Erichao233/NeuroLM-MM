@@ -5,21 +5,23 @@ https://github.com/935963004/NeuroLM
 
 import os
 import time
+import math
 import argparse
 from contextlib import nullcontext
 
 import numpy as np
 import torch
-import torch._dynamo.config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model.model_vq import VQ_Align
+from model.model_neurolm import NeuroLM
+from model.model_vq import VQ
 from model.model_neural_transformer import NTConfig
+from model.model import GPTConfig
 from dataset import PickleLoader
 from pathlib import Path
 from utils import cosine_scheduler
-import math
+from collections import OrderedDict
 
 
 master_process = None; device = None; dtype = None
@@ -64,7 +66,7 @@ def main(args):
 
     init(args)
 
-    checkpoint_out_dir = os.path.join(args.out_dir, f'checkpoints/{args.vq_name}')
+    checkpoint_out_dir = os.path.join(args.out_dir, 'checkpoints/NeuroLM-B')
     if master_process:
         os.makedirs(checkpoint_out_dir, exist_ok=True)
 
@@ -78,8 +80,8 @@ def main(args):
         else:
             data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
         ix = torch.randint(len(data) - args.block_size, (args.text_batch_size,))
-        x = torch.stack([torch.from_numpy((data[i:i+args.block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i+1:i+1+args.block_size]).astype(np.int64)) for i in ix])
+        x = torch.stack([torch.from_numpy((data[i:i + args.block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i + 1:i + 1 + args.block_size]).astype(np.int64)) for i in ix])
         if device_type == 'cuda':
             # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
             x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -87,18 +89,12 @@ def main(args):
             x, y = x.to(device), y.to(device)
         return x, y
 
-
-    print('prepare dataloader...')
-    ds_root = Path(args.dataset_dir)
-    # allow passing either the dataset root (with train/val) or a concrete split folder with pkls
-    if ds_root.is_dir() and any(ds_root.glob('*.pkl')):
-        files = [f for f in ds_root.glob('*.pkl')]
-    else:
-        files = [file for file in Path(ds_root, 'train').rglob('*.pkl')]
-    if len(files) == 0:
-        raise RuntimeError(f"No training .pkl found under {args.dataset_dir}. Pass the split folder with pkls or the dataset root containing 'train/'.")
-    dataset_train = PickleLoader(files)
-    print('finished!')
+    train_files = Path(args.dataset_dir, 'train').rglob('*.pkl')
+    train_files = [file for file in train_files]
+    dataset_train = PickleLoader(train_files, GPT_training=True)
+    val_files = Path(args.dataset_dir, 'val').rglob('*.pkl')
+    val_files = [file for file in val_files]
+    dataset_val = PickleLoader(val_files, GPT_training=True)
 
     if ddp:
         sampler_train = torch.utils.data.DistributedSampler(
@@ -106,91 +102,114 @@ def main(args):
         )
         data_loader_train = torch.utils.data.DataLoader(
             dataset_train, sampler=sampler_train,
-            batch_size=args.batch_size,
+            batch_size=args.eeg_batch_size,
             num_workers=10,
             pin_memory=True,
             drop_last=True,
         )
+        sampler_val = torch.utils.data.DistributedSampler(
+            dataset_val, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False
+        )
+        data_loader_val = torch.utils.data.DataLoader(
+            dataset_val, sampler=sampler_val,
+            batch_size=int(1.5 * args.eeg_batch_size),
+            num_workers=10,
+            pin_memory=True,
+            drop_last=False,
+        )
     else:
         data_loader_train = torch.utils.data.DataLoader(
             dataset_train,
-            batch_size=args.batch_size,
+            batch_size=args.eeg_batch_size,
             num_workers=10,
             pin_memory=True,
             drop_last=True,
             shuffle=True
         )
+        data_loader_val = torch.utils.data.DataLoader(
+            dataset_val,
+            batch_size=int(1.5 * args.eeg_batch_size),
+            num_workers=10,
+            pin_memory=True,
+            drop_last=False,
+            shuffle=False
+        )
 
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-    iter_num = 0
 
-    # model init
+    # load tokenizer
     encoder_args = dict(n_layer=12, n_head=12, n_embd=768, block_size=1024,
                     bias=False, dropout=0., num_classes=0, in_chans=1, out_chans=16)
     decoder_args = dict(n_layer=4, n_head=12, n_embd=768, block_size=1024,
                     bias=False, dropout=0., num_classes=0, in_chans=128)
 
+    tokenizer_ckpt_path = os.path.join(args.out_dir, args.tokenizer_path)
+    tokenizer_checkpoint = torch.load(tokenizer_ckpt_path, map_location=device)
+    tokenizer_checkpoint_model_args = tokenizer_checkpoint['encoder_args']
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias']:
+        encoder_args[k] = tokenizer_checkpoint_model_args[k]
+    tokenizer_checkpoint_model_args = tokenizer_checkpoint['decoder_args']
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias']:
+        decoder_args[k] = tokenizer_checkpoint_model_args[k]
+    # create the model
+    encoder_conf = NTConfig(**encoder_args)
+    decoder_conf = NTConfig(**decoder_args)
+    tokenizer = VQ(encoder_conf, decoder_conf)
+    tokenizer_state_dict = tokenizer_checkpoint['model']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(tokenizer_state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            tokenizer_state_dict[k[len(unwanted_prefix):]] = tokenizer_state_dict.pop(k)
+    all_keys = list(tokenizer_state_dict.keys())
+    new_dict = OrderedDict()
+    for key in all_keys:
+        if key.startswith('VQ.'):
+            new_dict[key[3:]] = tokenizer_state_dict[key]
+    tokenizer.load_state_dict(new_dict)
+    tokenizer.eval()
+    tokenizer.to(device)
+    # free up memory
+    tokenizer_checkpoint = None
+
     if os.path.exists(os.path.join(checkpoint_out_dir, 'ckpt.pt')):
         init_from = 'resume'
     else:
-        init_from = 'scratch'
+        # gpt2 for NeuroLM-B, gpt2-medium for NeuroLM-L, gpt2-xl for NeuroLM-XL
+        init_from = 'gpt2'
 
+    iter_num = 0
+    # model init
+    n_layer = 12
+    n_head = 12
+    n_embd = 768
+    dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+    bias = False # do we use bias inside LayerNorm and Linear layers?
+    model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=args.block_size,
+                    bias=bias, vocab_size=50257, dropout=dropout) # start with model_args from command line
     if init_from == 'scratch':
         # init a new model from scratch
         print("Initializing a new model from scratch")
         # determine the vocab size we'll use for from-scratch training
-        encoder_conf = NTConfig(**encoder_args)
-        decoder_conf = NTConfig(**decoder_args)
-        vq_kwargs = dict(shared_codes=max(0, int(args.shared_codes)), private_codes=max(0, int(args.private_codes)))
-        
-        # Load or create shared quantizer for cross-modal sharing
-        shared_quantizer = None
-        if args.shared_codes > 0 and args.shared_quantizer_path:
-            print(f"Loading shared quantizer from {args.shared_quantizer_path}")
-            shared_ckpt = torch.load(args.shared_quantizer_path, map_location=device)
-            # Extract shared quantizer from another VQ_Align model
-            if 'model' in shared_ckpt:
-                temp_model = VQ_Align(encoder_conf, decoder_conf, vq_kwargs=vq_kwargs)
-                temp_model.load_state_dict(shared_ckpt['model'])
-                shared_quantizer = temp_model.VQ.quantize_shared
-                print(f"Loaded shared quantizer with {shared_quantizer.num_tokens} codes")
-        
-        model = VQ_Align(encoder_conf, decoder_conf, infonce_weight=args.infonce_weight, 
-                        intra_periph_pred_weight=args.intra_periph_pred_weight, 
-                        vq_kwargs=vq_kwargs, shared_quantizer=shared_quantizer)
+        gptconf = GPTConfig(**model_args)
+        model = NeuroLM(gptconf, init_from=init_from)
         start_epoch = 0
     elif init_from == 'resume':
         print(f"Resuming training from {checkpoint_out_dir}")
         # resume training from a checkpoint.
         ckpt_path = os.path.join(checkpoint_out_dir, 'ckpt.pt')
         checkpoint = torch.load(ckpt_path, map_location=device)
-        checkpoint_model_args = checkpoint['encoder_args']
+        checkpoint_model_args = checkpoint['model_args']
         # force these config attributes to be equal otherwise we can't even resume training
         # the rest of the attributes (e.g. dropout) can stay as desired from command line
-        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias']:
-            encoder_args[k] = checkpoint_model_args[k]
-        checkpoint_model_args = checkpoint['decoder_args']
-        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias']:
-            decoder_args[k] = checkpoint_model_args[k]
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            model_args[k] = checkpoint_model_args[k]
         # create the model
-        encoder_conf = NTConfig(**encoder_args)
-        decoder_conf = NTConfig(**decoder_args)
-        vq_kwargs = dict(shared_codes=max(0, int(args.shared_codes)), private_codes=max(0, int(args.private_codes)))
-        
-        # Load shared quantizer if specified
-        shared_quantizer = None
-        if args.shared_codes > 0 and args.shared_quantizer_path:
-            print(f"Loading shared quantizer from {args.shared_quantizer_path}")
-            shared_ckpt = torch.load(args.shared_quantizer_path, map_location=device)
-            if 'model' in shared_ckpt:
-                temp_model = VQ_Align(encoder_conf, decoder_conf, vq_kwargs=vq_kwargs)
-                temp_model.load_state_dict(shared_ckpt['model'])
-                shared_quantizer = temp_model.VQ.quantize_shared
-                print(f"Loaded shared quantizer with {shared_quantizer.num_tokens} codes")
-        
-        model = VQ_Align(encoder_conf, decoder_conf, infonce_weight=args.infonce_weight, 
-                        intra_periph_pred_weight=args.intra_periph_pred_weight, 
-                        vq_kwargs=vq_kwargs, shared_quantizer=shared_quantizer)
+        gptconf = GPTConfig(**model_args)
+        model = NeuroLM(gptconf, init_from='scratch')
         state_dict = checkpoint['model']
         # fix the keys of the state dictionary :(
         # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -201,6 +220,16 @@ def main(args):
         model.load_state_dict(state_dict)
         iter_num = checkpoint['iter_num']
         start_epoch = checkpoint['epoch'] + 1
+    elif init_from.startswith('gpt2'):
+        print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+        # initialize from OpenAI GPT-2 weights
+        gptconf = GPTConfig(**model_args)
+        model = NeuroLM(gptconf, tokenizer_ckpt_path, init_from=init_from)
+        # read off the created config params, so we can store them into checkpoint correctly
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            model_args[k] = getattr(model.GPT2.config, k)
+        start_epoch = 0
+    print('Number parameters:', model.get_num_params())
 
     model.to(device)
 
@@ -226,15 +255,14 @@ def main(args):
     # logging
     if args.wandb_log and master_process:
         import wandb
-        os.environ["WANDB_API_KEY"] = args.wandb_api_keys
+        os.environ["WANDB_API_KEY"] = args.wandb_api_key
         wandb.init(project=args.wandb_project, name=args.wandb_run_name, dir=os.path.join(args.out_dir, 'wandb'), resume=True)
 
-    num_training_steps_per_epoch = max(1, len(dataset_train) // args.batch_size // max(1, ddp_world_size))
+    num_training_steps_per_epoch = len(dataset_train) // args.eeg_batch_size // ddp_world_size
     lr_schedule_values = cosine_scheduler(
         args.learning_rate, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs
     )
-
 
     # training loop
     X_text, Y_text = get_batch('train') # fetch the very first batch
@@ -248,6 +276,20 @@ def main(args):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
 
+            X_eeg, input_chans, input_time, input_mask, gpt_mask, num_chans, num_tokens = batch
+            X_eeg = X_eeg.float().to(device, non_blocking=True)
+            input_chans = input_chans.to(device, non_blocking=True)
+            input_time = input_time.to(device, non_blocking=True)
+            input_mask = input_mask.to(device, non_blocking=True)
+            gpt_mask = gpt_mask.to(device, non_blocking=True)
+
+            with torch.no_grad():
+                with ctx:
+                    Y_eeg = torch.full((X_eeg.size(0), X_eeg.size(1)), fill_value=-1-raw_model.GPT2.config.vocab_size).to(device, non_blocking=True)
+                    codebook_indices = tokenizer.get_codebook_indices(X_eeg, input_chans, input_time, input_mask)
+                    for i, (num_chan, num_token) in enumerate(zip(num_chans, num_tokens)):
+                        Y_eeg[i, :num_token - num_chan] = codebook_indices[i, num_chan:num_token]
+
             # forward backward update, with optional gradient accumulation to simulate larger batch size
             # and using the GradScaler if data type is float16
             if ddp:
@@ -256,20 +298,14 @@ def main(args):
                 # I really dislike that this bloats the code and forces us to repeat code
                 # looking at the source of that context manager, it just toggles this variable
                 model.require_backward_grad_sync = (step + 1) % args.gradient_accumulation_steps == 0
-            
-            X, Y_freq, Y_raw, input_chans, input_time, input_mask = batch
-            X = X.float().to(device, non_blocking=True)
-            Y_freq = Y_freq.float().to(device, non_blocking=True)
-            Y_raw = Y_raw.float().to(device, non_blocking=True)
-            input_chans = input_chans.to(device, non_blocking=True)
-            input_time = input_time.to(device, non_blocking=True)
-            input_mask = input_mask.to(device, non_blocking=True)
 
             with ctx:
-                alpha = 2 / (1 + math.exp(-10 * iter_num / args.epochs / num_training_steps_per_epoch)) - 1
-                loss, domain_loss, log = model(X, Y_freq, Y_raw, input_chans, input_time, input_mask, alpha)
-                domain_loss2 = model(X_text)
-                loss = (loss + domain_loss + domain_loss2) / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
+                # eeg
+                loss1, log1, _ = model(X_eeg, Y_eeg, None, None, input_chans, input_time, input_mask, eeg_mask=gpt_mask)
+                # text
+                loss2, log2, _ = model(None, None, X_text, Y_text)
+        
+                loss = (loss1 + loss2) / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
@@ -283,24 +319,22 @@ def main(args):
                 scaler.update()
                 # flush the gradients as soon as we can, no need for this memory anymore
                 optimizer.zero_grad(set_to_none=True)
+            
+            X_text, Y_text = get_batch('train')
 
             # evaluate the loss on train/val sets and write checkpoints
             if (iter_num + 1) % args.log_interval == 0 and master_process:
-                print(f"epoch {epoch} step [{step + 1}/{num_training_steps_per_epoch}]: train loss {log['train/total_loss']:.4f}, freq loss {log['train/rec_freq_loss']:.4f}, raw loss {log['train/rec_raw_loss']:.4f}, quant loss {log['train/quant_loss']:.4f} \
-                    domain loss {log['train/domain_loss'] + domain_loss2.item():.4f}")
-
+                print(f"epoch {epoch} step [{step + 1}/{num_training_steps_per_epoch}]: train total loss {log1['train/loss'] + log2['train/loss']:.4f}, eeg loss {log1['train/loss']:.4f}, text loss {log2['train/loss']:.4f}")
                 if args.wandb_log:
                     wandb.log({
                         "iter": iter_num,
-                        "train/total_loss": log['train/total_loss'],
-                        "train/freq_loss": log['train/rec_freq_loss'],
-                        "train/raw_loss": log['train/rec_raw_loss'],
-                        "train/quant_loss": log['train/quant_loss'],
-                        "train/domain_loss": log['train/domain_loss'] + domain_loss2.item(),
+                        "train/total_loss": log1['train/loss'] + log2['train/loss'],
+                        "train/eeg_loss": log1['train/loss'],
+                        "train/text_loss": log2['train/loss'],
+                        "train/eeg_accuracy": log1['train/accuracy'],
+                        "train/text_accuracy": log2['train/accuracy'],
                         "lr": lr
                     })
-            
-            X_text, Y_text = get_batch('train') # fetch the very first batch
 
             # timing and logging
             t1 = time.time()
@@ -310,73 +344,104 @@ def main(args):
             iter_num += 1
             local_iter_num += 1
         
+        # valiation
+        loss, accuracy = evaluate(model, raw_model, tokenizer, data_loader_val)
+        if master_process:
+            print('='* 10)
+            print(f"Evaluate : loss {loss:.4f}, accuracy {accuracy:.4f}, perplexity {math.exp(loss):.4f}")
+            print('='* 10)
+            if args.wandb_log:
+                wandb.log({
+                            "val/eeg_loss": loss,
+                            "val/eeg_accuracy": accuracy,
+                            'val/perplexity': math.exp(loss),
+                        })
+        
         if master_process:
             checkpoint = {
                 'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'encoder_args': encoder_args,
-                'decoder_args': decoder_args,
+                'model_args': model_args,
                 'iter_num': iter_num,
                 'epoch': epoch
             }
             print(f"saving checkpoint to {checkpoint_out_dir}")
-            path_ckpt = os.path.join(checkpoint_out_dir, f'ckpt.pt')
-            torch.save(checkpoint, path_ckpt)
-            # also save a modality-distinct root file for convenience, e.g., checkpoints/VQ_ECG.pt
-            root_ckpt = os.path.join(args.out_dir, f'checkpoints/{args.vq_name}.pt')
-            torch.save(checkpoint, root_ckpt)
-        
+            torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt.pt'))
+
             if (epoch + 1) % args.save_ckpt_freq == 0:
                 print(f"saving checkpoint {epoch} to {checkpoint_out_dir}")
                 torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt-{epoch}.pt'))
-
+    
     if ddp:
         destroy_process_group()
+
+
+@torch.no_grad()
+def evaluate(model, raw_model, tokenizer, dataloader):
+    model.eval()
+    loss = []
+    acc = []
+    for _, (batch) in enumerate(dataloader):
+        X_eeg, input_chans, input_time, input_mask, gpt_mask, num_chans, num_tokens = batch
+        X_eeg = X_eeg.float().to(device, non_blocking=True)
+        input_chans = input_chans.to(device, non_blocking=True)
+        input_time = input_time.to(device, non_blocking=True)
+        input_mask = input_mask.to(device, non_blocking=True)
+        gpt_mask = gpt_mask.to(device, non_blocking=True)
+
+        with ctx:
+            Y_eeg = torch.full((X_eeg.size(0), X_eeg.size(1)), fill_value=-1-raw_model.GPT2.config.vocab_size).to(device, non_blocking=True)
+            codebook_indices = tokenizer.get_codebook_indices(X_eeg, input_chans, input_time, input_mask)
+            for i, (num_chan, num_token) in enumerate(zip(num_chans, num_tokens)):
+                Y_eeg[i, :num_token - num_chan] = codebook_indices[i, num_chan:num_token]
+
+        with ctx:
+            _, log, _ = model(X_eeg, Y_eeg, None, None, input_chans, input_time, input_mask, eeg_mask=gpt_mask)
+        
+        loss.append(log['val/loss'])
+        acc.append(log['val/accuracy'])
+
+    model.train()
+    
+    return np.mean(loss), np.mean(acc)
 
 
 def get_args():
     parser = argparse.ArgumentParser('VQ training script', add_help=False)
     parser.add_argument('--out_dir', default='./', help='path where to save, empty for no saving')
     parser.add_argument('--dataset_dir', default='./', help='path where to save, empty for no saving')
+    parser.add_argument('--tokenizer_path', default='checkpoints/VQ.pt', help='path where tokenizer is')
     parser.add_argument('--log_interval', default=10, type=int)
-    parser.add_argument('--vq_name', default='VQ', help='name for VQ checkpoint folder/file under checkpoints/')
     parser.add_argument('--wandb_log', default=False, action='store_true')
     parser.add_argument('--wandb_project', default='NeuroLM')
-    parser.add_argument('--wandb_runname', default='VQ')
+    parser.add_argument('--wandb_runname', default='pretrain')
     parser.add_argument('--wandb_api_key', type=str)
     # training args
-    parser.add_argument('--gradient_accumulation_steps', default=4, type=int)
-    parser.add_argument('--batch_size', default=16, type=int)
-    parser.add_argument('--text_batch_size', default=8, type=int)
-    parser.add_argument('--epochs', default=50, type=int)
-    parser.add_argument('--warmup_epochs', default=5, type=int)
-    parser.add_argument('--save_ckpt_freq', default=10, type=int)
+    parser.add_argument('--gradient_accumulation_steps', default=1, type=int)
+    parser.add_argument('--eeg_batch_size', default=60, type=int)
+    parser.add_argument('--text_batch_size', default=4, type=int)
+    parser.add_argument('--epochs', default=20, type=int)
+    parser.add_argument('--warmup_epochs', default=2, type=int)
+    parser.add_argument('--save_ckpt_freq', default=5, type=int)
     parser.add_argument('--block_size', default=1024, type=int)
 
-    parser.add_argument('--learning_rate', type=float, default=5e-5, metavar='LR',
-                        help='learning rate (default: 5e-5)')
-    parser.add_argument('--min_lr', type=float, default=1e-5)
-    parser.add_argument('--weight_decay', type=float, default=1e-4,
-                        help='weight decay (default: 1e-4)')
+    parser.add_argument('--learning_rate', type=float, default=6e-4, metavar='LR',
+                        help='learning rate (default: 6e-4)')
+    parser.add_argument('--min_lr', type=float, default=6e-5)
+    parser.add_argument('--weight_decay', type=float, default=1e-1,
+                        help='weight decay (default: 1e-1)')
     parser.add_argument('--beta1', type=float, default=0.9)
-    parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--grad_clip', type=float, default=0.0,
+    parser.add_argument('--beta2', type=float, default=0.95)
+    parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='clip gradients at this value, or disable if == 0.0')
     parser.add_argument('--decay_lr', default=True, action='store_false')
     parser.add_argument('--seed', default=1337, type=int)
 
     parser.add_argument('--compile', default=False, action='store_true')
-    # PhysioOmni-style options for shared+private codebook and consistency losses (to be plumbed through VQ kwargs)
-    parser.add_argument('--shared_codes', type=int, default=0, help='size of shared codebook (0 to disable)')
-    parser.add_argument('--private_codes', type=int, default=0, help='size of private codebook (0 to disable)')
-    parser.add_argument('--shared_quantizer_path', type=str, default='', help='path to load shared quantizer from another modality (for cross-modal sharing)')
-    parser.add_argument('--infonce_weight', type=float, default=0.0, help='InfoNCE weight for shared codes (0 to disable)')
-    parser.add_argument('--intra_periph_pred_weight', type=float, default=0.0, help='EOG/ECG/EMG intra-group predict/reconstruction loss weight')
 
     return parser.parse_args()
 
 
 if __name__ == '__main__':
-    torch._dynamo.config.optimize_ddp = False
     args = get_args()
     main(args)

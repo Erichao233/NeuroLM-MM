@@ -19,6 +19,8 @@ from model.model_vq import VQ
 from model.model_neural_transformer import NTConfig
 from model.model import GPTConfig
 from dataset import PickleLoader
+from downstream_dataset import HMC_EEG_ECG_PretrainLoader
+from downstream_dataset import HMC_Peripheral_PretrainLoader, HMC_EEG_Peripheral_PretrainLoader
 from pathlib import Path
 from utils import cosine_scheduler
 from collections import OrderedDict
@@ -35,7 +37,7 @@ def init(args):
     backend = 'nccl' # 'nccl', 'gloo', etc.
     device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
     dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-    
+    #dtype = 'float32'
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
     if ddp:
         init_process_group(backend=backend)
@@ -89,12 +91,53 @@ def main(args):
             x, y = x.to(device), y.to(device)
         return x, y
 
-    train_files = Path(args.dataset_dir, 'train').rglob('*.pkl')
-    train_files = [file for file in train_files]
-    dataset_train = PickleLoader(train_files, GPT_training=True)
-    val_files = Path(args.dataset_dir, 'val').rglob('*.pkl')
-    val_files = [file for file in val_files]
-    dataset_val = PickleLoader(val_files, GPT_training=True)
+    if args.dataset_mode == 'single':
+        train_files = Path(args.dataset_dir, 'train').rglob('*.pkl')
+        train_files = [file for file in train_files]
+        dataset_train = PickleLoader(train_files, GPT_training=True)
+        # support both 'val' and 'eval'
+        val_dir = 'val' if Path(args.dataset_dir, 'val').exists() else 'eval'
+        val_files = Path(args.dataset_dir, val_dir).rglob('*.pkl')
+        val_files = [file for file in val_files]
+        dataset_val = PickleLoader(val_files, GPT_training=True)
+    elif args.dataset_mode == 'mm_eeg_ecg':
+        # multimodal EEG+ECG
+        eeg_root = Path(args.dataset_dir_eeg)
+        ecg_root = Path(args.dataset_dir_ecg)
+        eeg_train = [f.name for f in Path(eeg_root, 'train').glob('*.pkl')]
+        eeg_eval = [f.name for f in Path(eeg_root, 'eval').glob('*.pkl')] if Path(eeg_root, 'eval').exists() else [f.name for f in Path(eeg_root, 'val').glob('*.pkl')]
+        ecg_train = [f.name for f in Path(ecg_root, 'train').glob('*.pkl')]
+        ecg_eval = [f.name for f in Path(ecg_root, 'eval').glob('*.pkl')] if Path(ecg_root, 'eval').exists() else [f.name for f in Path(ecg_root, 'val').glob('*.pkl')]
+        dataset_train = HMC_EEG_ECG_PretrainLoader(str(Path(eeg_root, 'train')), eeg_train, str(Path(ecg_root, 'train')), ecg_train, block_size=args.block_size)
+        dataset_val = HMC_EEG_ECG_PretrainLoader(str(Path(eeg_root, 'eval')), eeg_eval, str(Path(ecg_root, 'eval')), ecg_eval, block_size=args.block_size)
+    else:
+        # full peripheral + EEG
+        eeg_root = Path(args.dataset_dir_eeg)
+        eog_root = Path(args.dataset_dir_eog)
+        ecg_root = Path(args.dataset_dir_ecg)
+        emg_root = Path(args.dataset_dir_emg)
+        eeg_train = [f.name for f in Path(eeg_root, 'train').glob('*.pkl')]
+        eeg_eval = [f.name for f in Path(eeg_root, 'eval').glob('*.pkl')] if Path(eeg_root, 'eval').exists() else [f.name for f in Path(eeg_root, 'val').glob('*.pkl')]
+        eog_train = [f.name for f in Path(eog_root, 'train').glob('*.pkl')] if eog_root.exists() else []
+        eog_eval = [f.name for f in Path(eog_root, 'eval').glob('*.pkl')] if Path(eog_root, 'eval').exists() else ([f.name for f in Path(eog_root, 'val').glob('*.pkl')] if eog_root.exists() else [])
+        ecg_train = [f.name for f in Path(ecg_root, 'train').glob('*.pkl')]
+        ecg_eval = [f.name for f in Path(ecg_root, 'eval').glob('*.pkl')] if Path(ecg_root, 'eval').exists() else [f.name for f in Path(ecg_root, 'val').glob('*.pkl')]
+        emg_train = [f.name for f in Path(emg_root, 'train').glob('*.pkl')] if emg_root.exists() else []
+        emg_eval = [f.name for f in Path(emg_root, 'eval').glob('*.pkl')] if Path(emg_root, 'eval').exists() else ([f.name for f in Path(emg_root, 'val').glob('*.pkl')] if emg_root.exists() else [])
+        dataset_train = HMC_EEG_Peripheral_PretrainLoader(
+            str(Path(eeg_root, 'train')), eeg_train,
+            str(Path(eog_root, 'train')) if eog_train else None, eog_train if eog_train else None,
+            str(Path(ecg_root, 'train')), ecg_train,
+            str(Path(emg_root, 'train')) if emg_train else None, emg_train if emg_train else None,
+            block_size=args.block_size
+        )
+        dataset_val = HMC_EEG_Peripheral_PretrainLoader(
+            str(Path(eeg_root, 'eval')), eeg_eval,
+            str(Path(eog_root, 'eval')) if eog_eval else None, eog_eval if eog_eval else None,
+            str(Path(ecg_root, 'eval')), ecg_eval,
+            str(Path(emg_root, 'eval')) if emg_eval else None, emg_eval if emg_eval else None,
+            block_size=args.block_size
+        )
 
     if ddp:
         sampler_train = torch.utils.data.DistributedSampler(
@@ -175,11 +218,14 @@ def main(args):
     # free up memory
     tokenizer_checkpoint = None
 
-    if os.path.exists(os.path.join(checkpoint_out_dir, 'ckpt.pt')):
-        init_from = 'resume'
-    else:
-        # gpt2 for NeuroLM-B, gpt2-medium for NeuroLM-L, gpt2-xl for NeuroLM-XL
+    if args.gpt_init:
         init_from = 'gpt2'
+    else:
+        if os.path.exists(os.path.join(checkpoint_out_dir, 'ckpt.pt')):
+            init_from = 'resume'
+        else:
+            # gpt2 for NeuroLM-B, gpt2-medium for NeuroLM-L, gpt2-xl for NeuroLM-XL
+            init_from = 'gpt2'
 
     iter_num = 0
     # model init
@@ -224,7 +270,9 @@ def main(args):
         print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
         # initialize from OpenAI GPT-2 weights
         gptconf = GPTConfig(**model_args)
-        model = NeuroLM(gptconf, tokenizer_ckpt_path, init_from=init_from)
+        # optional ECG tokenizer for future multi-modal MC-AR
+        tokenizer_ckpt_path_ecg = os.path.join(args.out_dir, args.tokenizer_path_ecg) if getattr(args, 'tokenizer_path_ecg', '') else None
+        model = NeuroLM(gptconf, tokenizer_ckpt_path, init_from=init_from, tokenizer_ckpt_path_ecg=tokenizer_ckpt_path_ecg)
         # read off the created config params, so we can store them into checkpoint correctly
         for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
             model_args[k] = getattr(model.GPT2.config, k)
@@ -409,8 +457,14 @@ def evaluate(model, raw_model, tokenizer, dataloader):
 def get_args():
     parser = argparse.ArgumentParser('VQ training script', add_help=False)
     parser.add_argument('--out_dir', default='./', help='path where to save, empty for no saving')
-    parser.add_argument('--dataset_dir', default='./', help='path where to save, empty for no saving')
-    parser.add_argument('--tokenizer_path', default='checkpoints/VQ.pt', help='path where tokenizer is')
+    parser.add_argument('--dataset_dir', default='/root/autodl-tmp/Datasets/pkl_data', help='path for single-modal pretrain')
+    parser.add_argument('--dataset_mode', choices=['single','mm_eeg_ecg','mm_full'], default='single', help='single or multimodal pretrain')
+    parser.add_argument('--dataset_dir_eeg', default='/root/autodl-tmp/NeuroLM/NeuroLM_fix/HMC', help='EEG root when dataset_mode=mm_*')
+    parser.add_argument('--dataset_dir_ecg', default='/root/autodl-tmp/NeuroLM/NeuroLM_fix/HMC_ECG', help='ECG root when dataset_mode=mm_*')
+    parser.add_argument('--dataset_dir_eog', default='/root/autodl-tmp/NeuroLM/NeuroLM_fix/HMC_EOG', help='EOG root when dataset_mode=mm_full')
+    parser.add_argument('--dataset_dir_emg', default='/root/autodl-tmp/NeuroLM/NeuroLM_fix/HMC_EMG', help='EMG root when dataset_mode=mm_full')
+    parser.add_argument('--tokenizer_path', default='checkpoints/VQ.pt', help='path where EEG tokenizer is')
+    parser.add_argument('--tokenizer_path_ecg', default='', help='path where ECG tokenizer is (optional)')
     parser.add_argument('--log_interval', default=10, type=int)
     parser.add_argument('--wandb_log', default=False, action='store_true')
     parser.add_argument('--wandb_project', default='NeuroLM')
@@ -418,7 +472,7 @@ def get_args():
     parser.add_argument('--wandb_api_key', type=str)
     # training args
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int)
-    parser.add_argument('--eeg_batch_size', default=60, type=int)
+    parser.add_argument('--eeg_batch_size', default=8, type=int)
     parser.add_argument('--text_batch_size', default=4, type=int)
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--warmup_epochs', default=2, type=int)
@@ -438,6 +492,7 @@ def get_args():
     parser.add_argument('--seed', default=1337, type=int)
 
     parser.add_argument('--compile', default=False, action='store_true')
+    parser.add_argument('--gpt_init', default=False, action='store_true', help='initialize LLM from gpt2 and load tokenizer(s)')
 
     return parser.parse_args()
 

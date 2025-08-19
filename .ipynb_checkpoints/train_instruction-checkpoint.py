@@ -17,7 +17,7 @@ from model.model_neurolm import NeuroLM
 from model.model import GPTConfig
 from pathlib import Path
 import tiktoken
-from utils import prepare_TUAB_dataset, prepare_TUEV_dataset, prepare_TUSL_dataset, prepare_HMC_dataset, prepare_HMC_ECG_dataset, prepare_HMC_EEG_ECG_dataset, prepare_HMC_EEG_ALL_dataset, prepare_Workload_dataset, cosine_scheduler, get_metrics
+from utils import prepare_TUAB_dataset, prepare_TUEV_dataset, prepare_TUSL_dataset, prepare_HMC_dataset, prepare_Workload_dataset, cosine_scheduler, get_metrics
 from downstream_dataset import SEEDDataset
 from torch.utils.data.dataset import ConcatDataset
 
@@ -76,7 +76,7 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             dataset_info['result_idx'] = 11
             dataset_info['label_dic'] = {'Positive': 0, 'Neutral': 1, 'Negative': 2}
         elif downstream_dataset == 'TUAB':
-            dataset_train, dataset_test, dataset_val = prepare_TUAB_dataset(Path(args.dataset_dir, 'edf/processed'), is_instruct=True, 
+            dataset_train, dataset_test, dataset_val = prepare_TUAB_dataset(Path(args.dataset_dir, 'TUAB/processed'), is_instruct=True, 
                                                                             eeg_max_len=eeg_max_len, text_max_len=text_max_len)
 
             dataset_info['metrics'] = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
@@ -110,40 +110,6 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             dataset_info['num_classes'] = 5
             dataset_info['result_idx'] = 22
             dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4}
-        elif downstream_dataset == 'HMC_ECG':
-            dataset_train, dataset_test, dataset_val = prepare_HMC_ECG_dataset(Path(args.dataset_dir, 'HMC_ECG'), is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-            dataset_info['is_binary'] = False
-            dataset_info['num_classes'] = 5
-            dataset_info['result_idx'] = 22
-            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4}
-        elif downstream_dataset == 'HMC_EEG_ECG':
-            eeg_root = Path(getattr(args, 'dataset_dir_eeg', '') or Path(args.dataset_dir, 'HMC'))
-            ecg_root = Path(getattr(args, 'dataset_dir_ecg', '') or Path(args.dataset_dir, 'HMC_ECG'))
-            dataset_train, dataset_test, dataset_val = prepare_HMC_EEG_ECG_dataset(eeg_root, ecg_root, is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-
-            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-            dataset_info['is_binary'] = False
-            dataset_info['num_classes'] = 5
-            dataset_info['result_idx'] = 22
-            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4}
-        elif downstream_dataset == 'HMC_EEG_ALL':
-            eeg_root = Path(getattr(args, 'dataset_dir_eeg', '') or Path(args.dataset_dir, 'HMC'))
-            eog_root = Path(getattr(args, 'dataset_dir_eog', '')) if getattr(args, 'dataset_dir_eog', '') else None
-            ecg_root = Path(getattr(args, 'dataset_dir_ecg', '')) if getattr(args, 'dataset_dir_ecg', '') else None
-            emg_root = Path(getattr(args, 'dataset_dir_emg', '')) if getattr(args, 'dataset_dir_emg', '') else None
-            dataset_train, dataset_test, dataset_val = prepare_HMC_EEG_ALL_dataset(
-                eeg_root, eog_root, ecg_root, emg_root,
-                is_instruct=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len
-            )
-
-            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-            dataset_info['is_binary'] = False
-            dataset_info['num_classes'] = 5
-            dataset_info['result_idx'] = 22
-            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4}
         elif downstream_dataset == 'Workload':
             dataset_train, dataset_test, dataset_val = prepare_Workload_dataset(Path(args.dataset_dir, 'EEGWorkload'), is_instruct=True, 
                                                                             eeg_max_len=eeg_max_len, text_max_len=text_max_len)
@@ -164,7 +130,7 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             data_loader_train = torch.utils.data.DataLoader(
                 dataset_train, sampler=sampler_train,
                 batch_size=args.eeg_batch_size,
-                num_workers=2,
+                num_workers=1,
                 pin_memory=True,
                 drop_last=True,
             )
@@ -172,7 +138,7 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             data_loader_val = torch.utils.data.DataLoader(
                 dataset_val, sampler=sampler_val,
                 batch_size=int(args.eeg_batch_size * 1.5),
-                num_workers=2,
+                num_workers=1,
                 pin_memory=True,
                 drop_last=False,
             )
@@ -180,7 +146,7 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             data_loader_test = torch.utils.data.DataLoader(
                 dataset_test, sampler=sampler_test,
                 batch_size=int(args.eeg_batch_size * 1.5),
-                num_workers=2,
+                num_workers=1,
                 pin_memory=True,
                 drop_last=False,
             )
@@ -188,7 +154,7 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             data_loader_train = torch.utils.data.DataLoader(
                 dataset_train,
                 batch_size=args.eeg_batch_size,
-                num_workers=2,
+                num_workers=1,
                 pin_memory=True,
                 drop_last=True,
                 shuffle=True
@@ -196,7 +162,7 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             data_loader_val = torch.utils.data.DataLoader(
                 dataset_val,
                 batch_size=int(args.eeg_batch_size * 1.5),
-                num_workers=2,
+                num_workers=1,
                 pin_memory=True,
                 drop_last=False,
                 shuffle=False
@@ -204,7 +170,7 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             data_loader_test = torch.utils.data.DataLoader(
                 dataset_test,
                 batch_size=int(args.eeg_batch_size * 1.5),
-                num_workers=2,
+                num_workers=1,
                 pin_memory=True,
                 drop_last=False,
                 shuffle=False
@@ -227,25 +193,17 @@ def main(args):
     # text data loader
     data_dir = os.path.join(args.out_dir, 'text')
     def get_batch(split):
-        # We recreate np.memmap every batch to avoid a memory leak
+        # We recreate np.memmap every batch to avoid a memory leak, as per
+        # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
         if split == 'train':
             data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
         else:
             data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-        # shard text batch across DDP ranks to balance memory
-        world_size = int(os.environ.get('WORLD_SIZE', '1'))
-        local_text_bs = max(1, args.text_batch_size // world_size)
-        ix = torch.randint(len(data) - args.block_size, (local_text_bs,)).tolist()
-        x_list, y_list = [], []
-        for i in ix:
-            i = int(i)
-            x_np = np.array(data[i:i + args.block_size], dtype=np.int64, copy=True)
-            y_np = np.array(data[i + 1:i + 1 + args.block_size], dtype=np.int64, copy=True)
-            x_list.append(torch.tensor(x_np, dtype=torch.long))
-            y_list.append(torch.tensor(y_np, dtype=torch.long))
-        x = torch.stack(x_list)
-        y = torch.stack(y_list)
+        ix = torch.randint(len(data) - args.block_size, (args.text_batch_size,))
+        x = torch.stack([torch.from_numpy((data[i:i + args.block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i + 1:i + 1 + args.block_size]).astype(np.int64)) for i in ix])
         if device_type == 'cuda':
+            # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
             x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         else:
             x, y = x.to(device), y.to(device)
@@ -253,9 +211,8 @@ def main(args):
 
     concat_datasets = True
     all_datasets = []
-    # Select dataset(s)
-    selected = [args.dataset_name]
-    for name in selected:
+    #for name in ['TUAB', 'TUEV', 'SEED', 'HMC', 'Workload', 'TUSL']:
+    for name in [ 'Workload']:
         all_datasets.append(get_instruct_datasets(args, name, eeg_max_len=276, text_max_len=80))
     if concat_datasets:
         merge_datasets = ConcatDataset([dataset_info['dataset_train'] for dataset_info in all_datasets])
@@ -284,22 +241,16 @@ def main(args):
     iter_num = 0
 
     tokenizer_ckpt_path = os.path.join(args.out_dir, args.tokenizer_path)
-    tokenizer_ckpt_path_ecg = os.path.join(args.out_dir, args.tokenizer_path_ecg) if getattr(args, 'tokenizer_path_ecg', '') else None
-    tokenizer_ckpt_path_eog = os.path.join(args.out_dir, args.tokenizer_path_eog) if getattr(args, 'tokenizer_path_eog', '') else None
-    tokenizer_ckpt_path_emg = os.path.join(args.out_dir, args.tokenizer_path_emg) if getattr(args, 'tokenizer_path_emg', '') else None
 
-    if args.gpt_init:
-        init_from = 'gpt'
+    if os.path.exists(os.path.join(checkpoint_out_dir, 'ckpt.pt')):
+        init_from = 'resume'
     else:
-        if os.path.exists(os.path.join(checkpoint_out_dir, 'ckpt.pt')):
-            init_from = 'resume'
-        else:
-            init_from = 'pretrained'
+        init_from = 'pretrained'
     # model init
     n_layer = 12
     n_head = 12
     n_embd = 768
-    dropout = 0.1 # for pretraining 0 is good, for finetuning try 0.1+
+    dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
     bias = False # do we use bias inside LayerNorm and Linear layers?
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=args.block_size,
                     bias=bias, vocab_size=50257, dropout=dropout) # start with model_args from command line
@@ -333,46 +284,29 @@ def main(args):
                         bias=bias, vocab_size=50257, dropout=dropout) # start with model_args from command line
         # create the model
         gptconf = GPTConfig(**model_args)
-        model = NeuroLM(gptconf, tokenizer_ckpt_path, init_from='gpt2', tokenizer_ckpt_path_ecg=tokenizer_ckpt_path_ecg, tokenizer_ckpt_path_eog=tokenizer_ckpt_path_eog, tokenizer_ckpt_path_emg=tokenizer_ckpt_path_emg)
+        model = NeuroLM(gptconf, tokenizer_ckpt_path, init_from='gpt2')
         start_epoch = 0
     elif init_from == 'pretrained':
         print(f"Initializing training from {args.NeuroLM_path}")
-        # load checkpoint
+        # resume training from a checkpoint.
         ckpt_path = os.path.join(args.out_dir, args.NeuroLM_path)
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
-        # align critical config fields
+        # force these config attributes to be equal otherwise we can't even resume training
+        # the rest of the attributes (e.g. dropout) can stay as desired from command line
         for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-            model_args[k] = checkpoint_model_args.get(k, model_args[k])
-        # build model same as pretrain: init from gpt2 and load modality tokenizers
+            model_args[k] = checkpoint_model_args[k]
+        # create the model
         gptconf = GPTConfig(**model_args)
-        model = NeuroLM(
-            gptconf,
-            tokenizer_ckpt_path,
-            init_from='gpt2',
-            tokenizer_ckpt_path_ecg=tokenizer_ckpt_path_ecg,
-            tokenizer_ckpt_path_eog=tokenizer_ckpt_path_eog,
-            tokenizer_ckpt_path_emg=tokenizer_ckpt_path_emg,
-        )
-        # prepare state dict and expand vocab to match checkpoint if needed
+        model = NeuroLM(gptconf, init_from='scratch')
         state_dict = checkpoint['model']
+        # fix the keys of the state dictionary :(
+        # honestly no idea how checkpoints sometimes get this prefix, have to debug more
         unwanted_prefix = '_orig_mod.'
-        for k, v in list(state_dict.items()):
+        for k,v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        # match vocab size to checkpoint tensors
-        if 'GPT2.transformer.wte.weight' in state_dict:
-            target_vocab = state_dict['GPT2.transformer.wte.weight'].shape[0]
-            if model.GPT2.config.vocab_size < target_vocab:
-                model.GPT2.enlarge_wte(target_vocab)
-                model.GPT2.enlarge_lm_head(target_vocab)
-        # load with non-strict to tolerate any harmless extras
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if master_process:
-            if missing:
-                print(f"Warning: missing keys when loading pretrained: {len(missing)}")
-            if unexpected:
-                print(f"Warning: unexpected keys when loading pretrained: {len(unexpected)}")
+        model.load_state_dict(state_dict)
         start_epoch = 0
 
     model.to(device)
@@ -387,15 +321,14 @@ def main(args):
     checkpoint = None # free up memory
 
     # compile the model
-    if args.compile:
+    if compile:
         print("compiling the model... (takes a ~minute)")
         unoptimized_model = model
         model = torch.compile(model) # requires PyTorch 2.0
 
     # wrap model into DDP container
     if ddp:
-        # allow unused params due to modality-conditional branches and text-only pass
-        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[ddp_local_rank])
 
     # logging
     if args.wandb_log and master_process:
@@ -452,32 +385,16 @@ def main(args):
                     # looking at the source of that context manager, it just toggles this variable
                     model.require_backward_grad_sync = (step + 1) % args.gradient_accumulation_steps == 0
 
-                if ddp:
-                    # DDP-safe path: alternate to avoid marking same params ready twice in one iter
-                    with ctx:
-                        do_eeg = (iter_num % 2 == 0)
-                        if do_eeg:
-                            loss1, log1, logits = model(X_eeg, Y_eeg, X_text, Y_text, input_chans, input_time, input_mask, eeg_text_mask=gpt_mask)
-                            loss2 = torch.tensor(0.0, device=device)
-                            log2 = {'train/loss': 0.0, 'train/accuracy': 0.0}
-                        else:
-                            loss1 = torch.tensor(0.0, device=device)
-                            log1 = {'train/loss': 0.0, 'train/accuracy': 0.0}
-                            loss2, log2, _ = model(None, None, X_text2, Y_text2)
-                        model.train()
-                        w = getattr(args, 'instruction_loss_weight', 0.7)
-                        loss = (w * loss1 + (1.0 - w) * loss2) / args.gradient_accumulation_steps
-                    scaler.scale(loss).backward()
-                else:
-                    with ctx:
-                        # single-GPU: compute both losses in same step
-                        loss1, log1, logits = model(X_eeg, Y_eeg, X_text, Y_text, input_chans, input_time, input_mask, eeg_text_mask=gpt_mask)
-                        loss2, log2, _ = model(None, None, X_text2, Y_text2)
-                        model.train()
-                        w = getattr(args, 'instruction_loss_weight', 0.7)
-                        loss = (w * loss1 + (1.0 - w) * loss2) / args.gradient_accumulation_steps
-                    scaler.scale(loss).backward()
+                with ctx:
+                    loss1, log1, logits = model(X_eeg, Y_eeg, X_text, Y_text, input_chans, input_time, input_mask, eeg_text_mask=gpt_mask)
+                    loss2, log2, _ = model(None, None, X_text2, Y_text2)
+                    
+                    model.train()
+
+                    loss = (loss1 + loss2) / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
+                # backward pass, with gradient scaling if training in fp16
+                scaler.scale(loss).backward()
 
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     # clip the gradient
@@ -561,214 +478,45 @@ def get_pred(pred_string, dataset_info):
     if dataset_info['name'] == 'zuco':
         pred = pred_string[17:].split('<|endoftext|>')[0]
     else:
-        import re
         pred = -1
         try:
-            answer_part = pred_string.split('Answer:')[-1]
-            m = re.search(r"\(([ABCDE])\)", answer_part)
-            if not m:
-                m = re.search(r"\(([ABCDE])\)", pred_string)
-            if m:
-                token = f"({m.group(1)})"
-                pred = dataset_info['label_dic'][token]
-            else:
-                m2 = re.search(r"[ABCDE]", answer_part)
-                if m2:
-                    token = f"({m2.group(0)})"
-                    pred = dataset_info['label_dic'][token]
-        except Exception:
-            print(f"Failed to parse pred_string: '{pred_string}'")
+            pred = pred_string.split(' ')[dataset_info['result_idx']]
+            if pred.startswith('('):
+                pred = pred[:3]
+            pred = dataset_info['label_dic'][pred]
+        except:
+            # if master_process:
+            #     print(f'label {pred} not found')
             pred = -1
-
     return pred
-
-# def get_pred(pred_string, dataset_info):
-#     if dataset_info['name'] == 'zuco':
-#         pred = pred_string[17:].split('<|endoftext|>')[0]
-#         return pred
-
-#     pred = -1
-#     try:
-#         # 从 "Answer:" 之后开始查找
-#         answer_part = pred_string.split('Answer:')[1]
-        
-#         # 清理字符串，去掉首尾空格和特殊字符
-#         cleaned_answer = answer_part.strip().lower()
-
-#         # 使用 startswith 来判断，这是最鲁棒的方法
-#         if cleaned_answer.startswith('yes'):
-#             pred = dataset_info['label_dic']['Yes']
-#         elif cleaned_answer.startswith('no'):
-#             pred = dataset_info['label_dic']['No']
-        
-#         if pred == -1:
-#             raise ValueError("Could not find 'yes' or 'no' at the start of the answer.")
-
-#     except Exception as e:
-#         # 只有在 master 进程打印，避免刷屏
-#         # 注意：因为DDP，master_process可能未定义在此函数作用域，直接用rank判断更安全
-#         if 'RANK' in os.environ and int(os.environ['RANK']) == 0:
-#             print(f"Failed to parse pred_string: '{pred_string}'. Reason: {e}")
-#         pred = -1
-        
-#     return pred
 
 @torch.no_grad()
 def evaluate(model, dataset_info, dataloader, decode):
     model.eval()
     preds = []
     targets = []
-    if ddp_rank is None or ddp_rank == 0:
-        print_once = True
-    else:
-        print_once = False
-    
-    # Switchable evaluation mode via env:
-    # EVAL_OPTION_SCORING=0 uses fast generate-based eval (may be biased);
-    # EVAL_OPTION_SCORING=1 uses slower but more accurate option-scoring.
-    use_option_scoring = os.environ.get('EVAL_OPTION_SCORING', '0') != '0'
-    max_eval_batches = int(os.environ.get('MAX_EVAL_BATCHES', '1000000'))
-
-    # fast path: original generate-based decoding
-    if not use_option_scoring:
-        for _, (batch) in enumerate(dataloader):
-            X_eeg, X_text, label, input_chans, input_time, input_mask, gpt_mask = batch
-            X_eeg = X_eeg.float().to(device, non_blocking=True)
-            X_text = X_text.to(device, non_blocking=True)
-            input_chans = input_chans.to(device, non_blocking=True)
-            input_time = input_time.to(device, non_blocking=True)
-            gpt_mask = gpt_mask.to(device, non_blocking=True)
-            if input_mask is not None:
-                input_mask = input_mask.to(device, non_blocking=True)
-
-            with ctx:
-                text = model.generate(
-                    X_eeg, X_text, input_chans, input_time, input_mask,
-                    eeg_text_mask=gpt_mask, max_new_tokens=3, temperature=0.8, top_k=1
-                )
-                text = text[:, 1:]
-                for i, t in enumerate(text):
-                    pred_string = decode(t.tolist())
-                    pred = get_pred(pred_string, dataset_info)
-                    if print_once:
-                        true_label = label[i].item()
-                        print(f"Generated Text: '{pred_string}' -> Parsed Pred: {pred}, True Label: {true_label}")
-                        print_once = False
-                    if not dataset_info['is_binary']:
-                        pred = np.eye(dataset_info['num_classes'])[pred]
-                    preds.append(pred)
-
-                targets.append(label)
-        model.train()
-        targets = torch.cat(targets, dim=0).numpy()
-        preds = np.array(preds)
-        results = get_metrics(preds, targets, dataset_info['metrics'], dataset_info['is_binary'])
-        return results
-
-    # Option-scoring inference: compute per-choice likelihood to avoid majority-class bias
-    # We reuse the loader's prompt and choice texts when available
-    loader_dataset = dataloader.dataset
-    prompt_tokens = getattr(loader_dataset, 'prompt', None)
-    choice_texts = getattr(loader_dataset, 'text', None)
-    for b_idx, (batch) in enumerate(dataloader):
+    for _, (batch) in enumerate(dataloader):
         X_eeg, X_text, label, input_chans, input_time, input_mask, gpt_mask = batch
         X_eeg = X_eeg.float().to(device, non_blocking=True)
         X_text = X_text.to(device, non_blocking=True)
         input_chans = input_chans.to(device, non_blocking=True)
         input_time = input_time.to(device, non_blocking=True)
+        gpt_mask = gpt_mask.to(device, non_blocking=True)
         if input_mask is not None:
             input_mask = input_mask.to(device, non_blocking=True)
 
-        batch_size = X_eeg.size(0)
-        # prepare dummy Y_eeg targets (ignored by loss)
-        vocab_size = model.GPT2.config.vocab_size
-        Y_eeg_dummy = torch.full((1, X_eeg.size(1)), fill_value=-1 - vocab_size, device=device)
+        with ctx:
+            text = model.generate(X_eeg, X_text, input_chans, input_time, input_mask, eeg_text_mask=gpt_mask, max_new_tokens=5)
+            text = text[:, 1:] # remove [SEP] token
+            for i, t in enumerate(text):
+                pred_string = decode(t.tolist())
 
-        # Helper to build gpt mask for a given text length
-        def build_gpt_mask(valid_eeg_len: int, total_eeg_tokens: int, text_len: int, input_time_vec: torch.Tensor) -> torch.BoolTensor:
-            # infer time steps and num_chans from input_time and valid_eeg_len
-            time_steps = int(input_time_vec.max().item()) + 1 if input_time_vec.numel() > 0 else 1
-            num_chans = max(1, valid_eeg_len // max(1, time_steps))
-            total_tokens = total_eeg_tokens + text_len
-            m = torch.tril(torch.ones(total_tokens, total_tokens, device=device)).view(1, total_tokens, total_tokens)
-            for i in range(time_steps):
-                s = i * num_chans
-                e = min((i + 1) * num_chans, valid_eeg_len)
-                if s < e:
-                    m[:, s:e, s:e] = 1
-            # zero out attention to padded EEG tokens if any
-            if valid_eeg_len < total_eeg_tokens:
-                m[:, :, valid_eeg_len:total_eeg_tokens] = 0
-            return m.bool()
+                pred = get_pred(pred_string, dataset_info)
+                if not dataset_info['is_binary']:
+                    pred = np.eye(dataset_info['num_classes'])[pred]
+                preds.append(pred)
 
-        for i in range(batch_size):
-            # take per-sample tensors
-            x_eeg_i = X_eeg[i].unsqueeze(0)
-            input_chans_i = input_chans[i].unsqueeze(0)
-            input_time_i = input_time[i].unsqueeze(0)
-            eeg_mask_i = input_mask[i] if input_mask is not None else torch.ones(x_eeg_i.size(1), device=device)
-            valid_eeg_len = int(eeg_mask_i.sum().item())
-
-            # get prompt from batch or dataset template
-            prompt_i = X_text[i]
-            if prompt_tokens is not None and isinstance(prompt_tokens, torch.Tensor):
-                # prefer canonical prompt length if batch has padding
-                prompt_i = prompt_tokens.to(device)
-            prompt_len = int((prompt_i != 50256).sum().item()) if prompt_i.numel() > 0 else prompt_i.size(0)
-            prompt_i = prompt_i[:prompt_len]
-
-            best_label = -1
-            best_loss = float('inf')
-            # iterate choices
-            num_classes = dataset_info.get('num_classes', 2) if not dataset_info.get('is_binary', False) else 2
-            for cls in range(num_classes):
-                # build candidate completion tail from dataset template when available
-                if choice_texts is not None and isinstance(choice_texts, dict) and cls in choice_texts:
-                    full = choice_texts[cls].to(device)
-                    # valid length until first pad (50256) if present
-                    valid_len = int((full != 50256).sum().item())
-                    tail = full[prompt_len:valid_len]
-                else:
-                    # fallback: minimal tail as e.g., '(A)'
-                    mapping = ['(A)', '(B)', '(C)', '(D)', '(E)']
-                    enc = tiktoken.get_encoding("gpt2")
-                    tail = torch.tensor(enc.encode(mapping[cls], allowed_special={"<|endoftext|>"}), device=device, dtype=torch.long)
-
-                x_text_i = torch.cat([prompt_i, tail], dim=0).unsqueeze(0)
-                # build Y_text that supervises only the completion tokens
-                y_text_i = torch.full_like(x_text_i, fill_value=-1, device=device)
-                start = prompt_i.size(0) - 1
-                end = x_text_i.size(1) - 1
-                if end >= start:
-                    y_text_i[:, start:end] = x_text_i[:, start + 1:end + 1]
-
-                # mask for this candidate
-                gpt_mask_i = build_gpt_mask(valid_eeg_len, x_eeg_i.size(1), x_text_i.size(1), input_time_i[0]).to(device)
-
-                with ctx:
-                    loss_i, _, _ = model(
-                        x_eeg_i, Y_eeg_dummy, x_text_i, y_text_i,
-                        input_chans_i, input_time_i, eeg_mask_i.unsqueeze(0).bool(),
-                        eeg_text_mask=gpt_mask_i,
-                    )
-                # pick lowest loss (highest likelihood)
-                scalar_loss = float(loss_i.detach().item()) if torch.is_tensor(loss_i) else float(loss_i)
-                if scalar_loss < best_loss:
-                    best_loss = scalar_loss
-                    best_label = cls
-
-            pred = best_label
-            if print_once:
-                true_label = label[i].item()
-                print(f"Option-scoring Pred: {pred}, True Label: {true_label}")
-                print_once = False
-            if not dataset_info['is_binary']:
-                pred = np.eye(dataset_info['num_classes'])[pred]
-            preds.append(pred)
-
-        targets.append(label)
-        if (b_idx + 1) >= max_eval_batches:
-            break
+            targets.append(label)
     
     model.train()
 
@@ -783,33 +531,25 @@ def get_args():
     parser = argparse.ArgumentParser('VQ training script', add_help=False)
     parser.add_argument('--out_dir', default='./', help='path where to save, empty for no saving')
     parser.add_argument('--dataset_dir', default='./', help='path where to save, empty for no saving')
-    parser.add_argument('--dataset_dir_eeg', default='', help='optional explicit EEG dataset root (e.g., HMC)')
-    parser.add_argument('--dataset_dir_eog', default='', help='optional explicit EOG dataset root (e.g., HMC_EOG)')
-    parser.add_argument('--dataset_dir_ecg', default='', help='optional explicit ECG dataset root (e.g., HMC_ECG)')
-    parser.add_argument('--dataset_dir_emg', default='', help='optional explicit EMG dataset root (e.g., HMC_EMG)')
-    parser.add_argument('--tokenizer_path', default='checkpoints/VQ.pt', help='path where EEG tokenizer is')
-    parser.add_argument('--tokenizer_path_ecg', default='', help='path where ECG tokenizer is (optional)')
-    parser.add_argument('--tokenizer_path_eog', default='', help='path where EOG tokenizer is (optional)')
-    parser.add_argument('--tokenizer_path_emg', default='', help='path where EMG tokenizer is (optional)')
+    parser.add_argument('--tokenizer_path', default='checkpoints/VQ.py', help='path where tokenizer is')
     parser.add_argument('--NeuroLM_path', default='checkpoints/NeuroLM-B.pt', help='path where NeuroLM model is')
     parser.add_argument('--log_interval', default=10, type=int)
-    parser.add_argument('--dataset_name', default='HMC_EEG_ECG', type=str, help='Dataset key: HMC, HMC_ECG, HMC_EEG_ECG, HMC_EEG_ALL, TUAB, TUEV, TUSL, Workload')
     parser.add_argument('--eval_only', default=False, action='store_true')
     parser.add_argument('--wandb_log', default=False, action='store_true')
     parser.add_argument('--wandb_project', default='NeuroLM')
     parser.add_argument('--wandb_runname', default='instruction-B')
     parser.add_argument('--wandb_api_key', type=str)
     # training args
-    parser.add_argument('--gradient_accumulation_steps', default=8, type=int)
-    parser.add_argument('--eeg_batch_size', default=8, type=int)
+    parser.add_argument('--gradient_accumulation_steps', default=1, type=int)
+    parser.add_argument('--eeg_batch_size', default=64, type=int)
     parser.add_argument('--text_batch_size', default=16, type=int)
-    parser.add_argument('--epochs', default=10, type=int)
+    parser.add_argument('--epochs', default=5, type=int)
     parser.add_argument('--warmup_epochs', default=1, type=int)
     parser.add_argument('--warmup_ratio', type=float, default=0.1)
     parser.add_argument('--save_ckpt_freq', default=5, type=int)
     parser.add_argument('--block_size', default=1024, type=int)
 
-    parser.add_argument('--learning_rate', type=float, default=5e-5, metavar='LR',
+    parser.add_argument('--learning_rate', type=float, default=5e-4, metavar='LR',
                         help='learning rate (default: 5e-4)')
     parser.add_argument('--min_lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=1e-1,
@@ -822,8 +562,6 @@ def get_args():
     parser.add_argument('--seed', default=1337, type=int)
 
     parser.add_argument('--compile', default=False, action='store_true')
-    parser.add_argument('--instruction_loss_weight', type=float, default=0.7)
-    parser.add_argument('--gpt_init', default=False, action='store_true', help='initialize LLM from gpt2 and load tokenizer(s) instead of loading NeuroLM-B.pt')
 
     return parser.parse_args()
 

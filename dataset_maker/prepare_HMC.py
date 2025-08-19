@@ -93,8 +93,8 @@ def save_pickle(object, filename):
         pickle.dump(object, f)
 
 
-root = "/D_data/weibangjiang/HMC/physionet.org/files/hmc-sleep-staging/1.1/recordings"
-out_dir = '../teamdrive/HMC'
+root = "/root/autodl-tmp/Datasets/HMC/hmc-sleep-staging/1.1/recordings"
+out_dir = '/root/autodl-tmp/NeuroLM/NeuroLM_fix/HMC'
 train_out_dir = os.path.join(out_dir, "train")
 eval_out_dir = os.path.join(out_dir, "eval")
 test_out_dir = os.path.join(out_dir, "test")

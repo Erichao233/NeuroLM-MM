@@ -64,7 +64,7 @@ def main(args):
 
     init(args)
 
-    checkpoint_out_dir = os.path.join(args.out_dir, f'checkpoints/{args.vq_name}')
+    checkpoint_out_dir = os.path.join(args.out_dir, 'checkpoints/VQ')
     if master_process:
         os.makedirs(checkpoint_out_dir, exist_ok=True)
 
@@ -89,14 +89,8 @@ def main(args):
 
 
     print('prepare dataloader...')
-    ds_root = Path(args.dataset_dir)
-    # allow passing either the dataset root (with train/val) or a concrete split folder with pkls
-    if ds_root.is_dir() and any(ds_root.glob('*.pkl')):
-        files = [f for f in ds_root.glob('*.pkl')]
-    else:
-        files = [file for file in Path(ds_root, 'train').rglob('*.pkl')]
-    if len(files) == 0:
-        raise RuntimeError(f"No training .pkl found under {args.dataset_dir}. Pass the split folder with pkls or the dataset root containing 'train/'.")
+    files = Path(args.dataset_dir, 'train').rglob('*.pkl')
+    files = [file for file in files]
     dataset_train = PickleLoader(files)
     print('finished!')
 
@@ -141,23 +135,7 @@ def main(args):
         # determine the vocab size we'll use for from-scratch training
         encoder_conf = NTConfig(**encoder_args)
         decoder_conf = NTConfig(**decoder_args)
-        vq_kwargs = dict(shared_codes=max(0, int(args.shared_codes)), private_codes=max(0, int(args.private_codes)))
-        
-        # Load or create shared quantizer for cross-modal sharing
-        shared_quantizer = None
-        if args.shared_codes > 0 and args.shared_quantizer_path:
-            print(f"Loading shared quantizer from {args.shared_quantizer_path}")
-            shared_ckpt = torch.load(args.shared_quantizer_path, map_location=device)
-            # Extract shared quantizer from another VQ_Align model
-            if 'model' in shared_ckpt:
-                temp_model = VQ_Align(encoder_conf, decoder_conf, vq_kwargs=vq_kwargs)
-                temp_model.load_state_dict(shared_ckpt['model'])
-                shared_quantizer = temp_model.VQ.quantize_shared
-                print(f"Loaded shared quantizer with {shared_quantizer.num_tokens} codes")
-        
-        model = VQ_Align(encoder_conf, decoder_conf, infonce_weight=args.infonce_weight, 
-                        intra_periph_pred_weight=args.intra_periph_pred_weight, 
-                        vq_kwargs=vq_kwargs, shared_quantizer=shared_quantizer)
+        model = VQ_Align(encoder_conf, decoder_conf)
         start_epoch = 0
     elif init_from == 'resume':
         print(f"Resuming training from {checkpoint_out_dir}")
@@ -175,22 +153,7 @@ def main(args):
         # create the model
         encoder_conf = NTConfig(**encoder_args)
         decoder_conf = NTConfig(**decoder_args)
-        vq_kwargs = dict(shared_codes=max(0, int(args.shared_codes)), private_codes=max(0, int(args.private_codes)))
-        
-        # Load shared quantizer if specified
-        shared_quantizer = None
-        if args.shared_codes > 0 and args.shared_quantizer_path:
-            print(f"Loading shared quantizer from {args.shared_quantizer_path}")
-            shared_ckpt = torch.load(args.shared_quantizer_path, map_location=device)
-            if 'model' in shared_ckpt:
-                temp_model = VQ_Align(encoder_conf, decoder_conf, vq_kwargs=vq_kwargs)
-                temp_model.load_state_dict(shared_ckpt['model'])
-                shared_quantizer = temp_model.VQ.quantize_shared
-                print(f"Loaded shared quantizer with {shared_quantizer.num_tokens} codes")
-        
-        model = VQ_Align(encoder_conf, decoder_conf, infonce_weight=args.infonce_weight, 
-                        intra_periph_pred_weight=args.intra_periph_pred_weight, 
-                        vq_kwargs=vq_kwargs, shared_quantizer=shared_quantizer)
+        model = VQ_Align(encoder_conf, decoder_conf)
         state_dict = checkpoint['model']
         # fix the keys of the state dictionary :(
         # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -229,7 +192,7 @@ def main(args):
         os.environ["WANDB_API_KEY"] = args.wandb_api_keys
         wandb.init(project=args.wandb_project, name=args.wandb_run_name, dir=os.path.join(args.out_dir, 'wandb'), resume=True)
 
-    num_training_steps_per_epoch = max(1, len(dataset_train) // args.batch_size // max(1, ddp_world_size))
+    num_training_steps_per_epoch = len(dataset_train) // args.batch_size // ddp_world_size
     lr_schedule_values = cosine_scheduler(
         args.learning_rate, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs
@@ -320,11 +283,7 @@ def main(args):
                 'epoch': epoch
             }
             print(f"saving checkpoint to {checkpoint_out_dir}")
-            path_ckpt = os.path.join(checkpoint_out_dir, f'ckpt.pt')
-            torch.save(checkpoint, path_ckpt)
-            # also save a modality-distinct root file for convenience, e.g., checkpoints/VQ_ECG.pt
-            root_ckpt = os.path.join(args.out_dir, f'checkpoints/{args.vq_name}.pt')
-            torch.save(checkpoint, root_ckpt)
+            torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt.pt'))
         
             if (epoch + 1) % args.save_ckpt_freq == 0:
                 print(f"saving checkpoint {epoch} to {checkpoint_out_dir}")
@@ -339,15 +298,14 @@ def get_args():
     parser.add_argument('--out_dir', default='./', help='path where to save, empty for no saving')
     parser.add_argument('--dataset_dir', default='./', help='path where to save, empty for no saving')
     parser.add_argument('--log_interval', default=10, type=int)
-    parser.add_argument('--vq_name', default='VQ', help='name for VQ checkpoint folder/file under checkpoints/')
     parser.add_argument('--wandb_log', default=False, action='store_true')
     parser.add_argument('--wandb_project', default='NeuroLM')
     parser.add_argument('--wandb_runname', default='VQ')
     parser.add_argument('--wandb_api_key', type=str)
     # training args
-    parser.add_argument('--gradient_accumulation_steps', default=4, type=int)
-    parser.add_argument('--batch_size', default=16, type=int)
-    parser.add_argument('--text_batch_size', default=8, type=int)
+    parser.add_argument('--gradient_accumulation_steps', default=1, type=int)
+    parser.add_argument('--batch_size', default=64, type=int)
+    parser.add_argument('--text_batch_size', default=16, type=int)
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--warmup_epochs', default=5, type=int)
     parser.add_argument('--save_ckpt_freq', default=10, type=int)
@@ -366,12 +324,6 @@ def get_args():
     parser.add_argument('--seed', default=1337, type=int)
 
     parser.add_argument('--compile', default=False, action='store_true')
-    # PhysioOmni-style options for shared+private codebook and consistency losses (to be plumbed through VQ kwargs)
-    parser.add_argument('--shared_codes', type=int, default=0, help='size of shared codebook (0 to disable)')
-    parser.add_argument('--private_codes', type=int, default=0, help='size of private codebook (0 to disable)')
-    parser.add_argument('--shared_quantizer_path', type=str, default='', help='path to load shared quantizer from another modality (for cross-modal sharing)')
-    parser.add_argument('--infonce_weight', type=float, default=0.0, help='InfoNCE weight for shared codes (0 to disable)')
-    parser.add_argument('--intra_periph_pred_weight', type=float, default=0.0, help='EOG/ECG/EMG intra-group predict/reconstruction loss weight')
 
     return parser.parse_args()
 

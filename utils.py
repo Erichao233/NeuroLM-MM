@@ -7,7 +7,7 @@ https://github.com/935963004/NeuroLM
 import math
 import numpy as np
 import os
-from downstream_dataset import TUABLoader, TUEVLoader, TUSLLoader, HMCLoader, WorkloadLoader
+from downstream_dataset import TUABLoader, TUEVLoader, TUSLLoader, HMCLoader, HMC_ECG_Loader, HMC_EEG_ECG_Loader, HMC_EEG_ALL_Loader, WorkloadLoader
 from metrics import binary_metrics_fn, multiclass_metrics_fn
 
 
@@ -95,6 +95,82 @@ def prepare_HMC_dataset(root, is_instruct=False, eeg_max_len=-1, text_max_len=-1
     test_dataset = HMCLoader(os.path.join(root, "test"), test_files, is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
     val_dataset = HMCLoader(os.path.join(root, "eval"), val_files, is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
     print(len(train_files), len(val_files), len(test_files))
+    return train_dataset, test_dataset, val_dataset
+
+
+def prepare_HMC_ECG_dataset(root, is_instruct=False, eeg_max_len=-1, text_max_len=-1):
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "eval"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    # prepare training and test data loader
+    train_dataset = HMC_ECG_Loader(os.path.join(root, "train"), train_files, is_instruct=is_instruct, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+    test_dataset = HMC_ECG_Loader(os.path.join(root, "test"), test_files, is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+    val_dataset = HMC_ECG_Loader(os.path.join(root, "eval"), val_files, is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+    print(len(train_files), len(val_files), len(test_files))
+    return train_dataset, test_dataset, val_dataset
+
+
+def prepare_HMC_EEG_ECG_dataset(eeg_root, ecg_root, is_instruct=False, eeg_max_len=-1, text_max_len=-1):
+    eeg_train = os.listdir(os.path.join(eeg_root, "train"))
+    eeg_val = os.listdir(os.path.join(eeg_root, "eval"))
+    eeg_test = os.listdir(os.path.join(eeg_root, "test"))
+
+    ecg_train = os.listdir(os.path.join(ecg_root, "train"))
+    ecg_val = os.listdir(os.path.join(ecg_root, "eval"))
+    ecg_test = os.listdir(os.path.join(ecg_root, "test"))
+
+    # build paired datasets
+    train_dataset = HMC_EEG_ECG_Loader(os.path.join(eeg_root, "train"), eeg_train, os.path.join(ecg_root, "train"), ecg_train, is_instruct=is_instruct, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+    test_dataset = HMC_EEG_ECG_Loader(os.path.join(eeg_root, "test"), eeg_test, os.path.join(ecg_root, "test"), ecg_test, is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+    val_dataset = HMC_EEG_ECG_Loader(os.path.join(eeg_root, "eval"), eeg_val, os.path.join(ecg_root, "eval"), ecg_val, is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+
+    print(len(train_dataset), len(val_dataset), len(test_dataset))
+    return train_dataset, test_dataset, val_dataset
+
+
+def prepare_HMC_EEG_ALL_dataset(eeg_root, eog_root=None, ecg_root=None, emg_root=None, is_instruct=False, eeg_max_len=-1, text_max_len=-1):
+    eeg_train = os.listdir(os.path.join(eeg_root, "train"))
+    eeg_val = os.listdir(os.path.join(eeg_root, "eval"))
+    eeg_test = os.listdir(os.path.join(eeg_root, "test"))
+
+    eog_train = os.listdir(os.path.join(eog_root, "train")) if eog_root else None
+    eog_val = os.listdir(os.path.join(eog_root, "eval")) if eog_root else None
+    eog_test = os.listdir(os.path.join(eog_root, "test")) if eog_root else None
+
+    ecg_train = os.listdir(os.path.join(ecg_root, "train")) if ecg_root else None
+    ecg_val = os.listdir(os.path.join(ecg_root, "eval")) if ecg_root else None
+    ecg_test = os.listdir(os.path.join(ecg_root, "test")) if ecg_root else None
+
+    emg_train = os.listdir(os.path.join(emg_root, "train")) if emg_root else None
+    emg_val = os.listdir(os.path.join(emg_root, "eval")) if emg_root else None
+    emg_test = os.listdir(os.path.join(emg_root, "test")) if emg_root else None
+
+    train_dataset = HMC_EEG_ALL_Loader(
+        os.path.join(eeg_root, "train"), eeg_train,
+        os.path.join(eog_root, "train") if eog_root else None, eog_train,
+        os.path.join(ecg_root, "train") if ecg_root else None, ecg_train,
+        os.path.join(emg_root, "train") if emg_root else None, emg_train,
+        is_instruct=is_instruct, eeg_max_len=eeg_max_len, text_max_len=text_max_len,
+    )
+    test_dataset = HMC_EEG_ALL_Loader(
+        os.path.join(eeg_root, "test"), eeg_test,
+        os.path.join(eog_root, "test") if eog_root else None, eog_test,
+        os.path.join(ecg_root, "test") if ecg_root else None, ecg_test,
+        os.path.join(emg_root, "test") if emg_root else None, emg_test,
+        is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len,
+    )
+    val_dataset = HMC_EEG_ALL_Loader(
+        os.path.join(eeg_root, "eval"), eeg_val,
+        os.path.join(eog_root, "eval") if eog_root else None, eog_val,
+        os.path.join(ecg_root, "eval") if ecg_root else None, ecg_val,
+        os.path.join(emg_root, "eval") if emg_root else None, emg_val,
+        is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len,
+    )
+
+    print(len(train_dataset), len(val_dataset), len(test_dataset))
     return train_dataset, test_dataset, val_dataset
 
 
